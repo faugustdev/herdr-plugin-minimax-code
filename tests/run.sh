@@ -1340,10 +1340,23 @@ case_22() {
   # Second probe, on the real tree: nothing from THIS checkout may be running
   # either. pgrep excludes itself, and the path is checkout-specific, so an
   # unrelated watcher the user has running elsewhere cannot mask a failure.
+  #
+  # AND ONLY FOR A PANE IN THIS SUITE'S OWN FAMILY. A developer who has this
+  # checkout LINKED as their installed plugin has watchers running from it -
+  # that is the documented way to test a branch - and those watchers are not
+  # this suite's business. Every pane this suite can start a watcher for is in
+  # the `wZ:pN` family: SRC_PANE, the split fixture's pane, and the per-case
+  # tags. Scoping the probe to that family keeps its power - a leak of the
+  # suite's own is still caught - and stops it failing on the developer's own
+  # live plugin.
+  #
+  # Measured on 2026-10-21: with the checkout linked as the plugin and a real
+  # pane open, this case failed on a watcher the plugin had legitimately
+  # started for `w4:p1`.
   if ! command -v pgrep >/dev/null 2>&1; then
     note "pgrep is required to assert that no watcher process is left behind"
-  elif pgrep -f -- "$(expected_watcher_path)" >/dev/null 2>&1; then
-    note "a watcher from this checkout is still running: $(pgrep -f -- "$(expected_watcher_path)" | tr '\n' ' ')"
+  elif pgrep -f -- "$(expected_watcher_path) wZ:p" >/dev/null 2>&1; then
+    note "a watcher from this checkout is still running: $(pgrep -f -- "$(expected_watcher_path) wZ:p" | tr '\n' ' ')"
   fi
 }
 
