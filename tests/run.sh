@@ -376,7 +376,16 @@ run_entrypoint() {
 # and a case that changed it would silently retarget every case after it. Only
 # cases 21-23 use this, and only with the copy stage_plugin hands them.
 run_entrypoint_at() { # run_entrypoint_at <entrypoint>
-  "$1" start >"$STDOUT_FILE" 2>"$STDERR_FILE"
+  run_entrypoint_verb_at "$1" start
+}
+
+# run_entrypoint_verb_at PATH VERB runs the entrypoint with a VERB other than
+# `start`. Separate from run_entrypoint_at because the verbs are DIFFERENT entry
+# paths - a helper that let a case drive the launcher when it meant to drive the
+# registrar would leave the registrar untested while every case stayed green,
+# which is the same failure mode run_event_handler_at exists to prevent.
+run_entrypoint_verb_at() { # run_entrypoint_verb_at <entrypoint> <verb>
+  "$1" "$2" >"$STDOUT_FILE" 2>"$STDERR_FILE"
   RC=$?
 }
 
@@ -2398,7 +2407,61 @@ case_43() { # #120: two ensure-watcher calls at the same instant start one watch
   fi
 }
 
-ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41 case-42 case-43)
+# --- case 44 ----------------------------------------------------------------
+# The register verb: a pane that is ALREADY running mcode, with no session
+# record yet, is invisible to herdr.
+#
+# mcode creates the session - and fires the SessionStart hook - on the FIRST
+# PROMPT, not when the TUI opens. Measured on 2026-10-21 against herdr 0.9.5:
+# an mcode left sitting at its start prompt produced no hook at all for
+# minutes, and the hook fired the moment the first prompt created the session.
+# Until then the pane is in no agent list and nothing tracks its state.
+#
+# The README's answer was "register it by hand with `herdr pane report-agent`",
+# which leaves the user to assemble a --source, a label, a unique name, a
+# resume command and a watcher, in the one order herdr accepts. This case
+# pins that sequence, because every part of it is load-bearing and three of
+# them are refused when they are out of order or wrong.
+case_44() {
+  setup_case
+  export HERDR_PANE_ID="$SRC_PANE"
+  local copy
+  copy="$(stage_plugin none)"
+
+  run_entrypoint_verb_at "$copy" register
+  assert_rc_zero "$RC"
+
+  # The sequence, in the order herdr accepts it:
+  #   agent get                 - is it already registered? (no second claim)
+  #   pane report-agent         - THE claim on the pane
+  #   agent list                - which names are taken
+  #   agent rename              - the unique name, installed here and only here
+  #   pane report-agent-session - accepted only because the claim exists
+  #   agent get                 - the sibling's read-back
+  local want
+  want="$(printf 'agent\tget\t%s' "$SRC_PANE")"
+  want="$(printf '%s\npane\treport-agent\t%s\t--source\therdr:minimax-code\t--agent\tmcode\t--state\tunknown' "$want" "$SRC_PANE")"
+  want="$(printf '%s\nagent\tlist' "$want")"
+  want="$(printf '%s\nagent\trename\t%s\tmcode' "$want" "$SRC_PANE")"
+  want="$(printf '%s\npane\treport-agent-session\t--source\therdr:minimax-code\t--agent\tmcode\t%s\t--\tmcode\t--continue' "$want" "$SRC_PANE")"
+  want="$(printf '%s\nagent\tget\t%s' "$want" "$SRC_PANE")"
+  assert_log_exactly "$want"
+
+  # THE ORDER OF THE FIRST TWO IS NOT OPTIONAL. `pane report-agent-session` is
+  # refused with `resume_not_accepted` unless the reporter already holds the
+  # pane, so the registration has to come first.
+  assert_log_order "pane	report-agent	$SRC_PANE" "pane	report-agent-session	--source"
+
+  # THE LABEL IS NOT A NAME. Every mcode pane shares the label `mcode`; the
+  # unique handle is installed by the rename. A report that carried the name
+  # would replace the pane's occupant and clear the name again - see
+  # bin/mcode-watch.sh for the measurement.
+  if ! grep -q "agent	rename	$SRC_PANE	mcode" "$FAKE_HERDR_LOG"; then
+    note "the pane was not renamed, so it has no name to be addressed by"
+  fi
+}
+
+ALL_CASES=(case-1 case-2 case-3 case-4 case-5 case-6 case-7 case-8 case-9 case-10 case-11 case-12 case-13 case-14 case-15 case-16 case-17 case-18 case-19 case-20 case-21 case-22 case-23 case-24 case-25 case-26 case-27 case-28 case-29 case-30 case-31 case-32 case-33 case-34 case-35 case-36 case-37 case-38 case-39 case-40 case-41 case-42 case-43 case-44)
 
 if [ ! -x "$FAKE_HERDR" ]; then
   printf 'tests/run.sh: %s is missing or not executable\n' "$FAKE_HERDR" >&2
@@ -2529,6 +2592,7 @@ for name in "${SELECTED[@]}"; do
     case-40) run_case case-40 case_40 ;;
     case-41) run_case case-41 case_41 ;;
     case-43) run_case case-43 case_43 ;;
+    case-44) run_case case-44 case_44 ;;
     *) printf 'unknown case: %s (try --list)\n' "$name" >&2; exit 2 ;;
   esac
 done

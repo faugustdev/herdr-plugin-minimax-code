@@ -1300,10 +1300,113 @@ cmd_install_hook() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# cmd_register - register a pane that is ALREADY running mcode.
+#
+# WHY THIS EXISTS. The launch path registers the pane it creates. The hook
+# registers the pane of every mcode session that fires SessionStart. Neither
+# covers the case a user hits most often by hand: a mcode that is ALREADY
+# running in a pane, in a directory, with no session record yet.
+#
+# mcode's SessionStart hook fires when the session is CREATED, which is on the
+# first prompt - measured on 2026-10-21 against herdr 0.9.5: an mcode left
+# sitting at its start prompt produced no hook at all for minutes, and the hook
+# fired the moment the first prompt created the session. Until then the pane is
+# invisible to herdr: `herdr agent list` does not show it, and nothing tracks
+# its state.
+#
+# The README's answer to that was "register it by hand with `herdr pane
+# report-agent`" - a command the user has to assemble themselves, with a
+# `--source` value, an agent label, a unique name, a resume command and a
+# watcher, all of which have to be right and all of which have to be in one
+# order. This action is that command, done properly.
+#
+# THE ORDER IS NOT OPTIONAL. `pane report-agent-session` is only accepted from
+# a reporter that already holds the pane, so the registration has to come
+# first. And the NAME is installed by `agent rename` alone: the label is the
+# agent's kind and every mcode pane shares it, so a report never carries the
+# name (see bin/mcode-watch.sh for why reporting one clears the other).
+#
+# It registers the pane the action was fired from, and nothing else.
+cmd_register() {
+  local pane
+  local src_rc=0
+  pane=$(resolve_source_pane) || src_rc=$?
+  if [ "$src_rc" -ne 0 ]; then
+    if [ "$src_rc" -eq 1 ]; then
+      die "\`${HERDR} pane current\` exited non-zero and HERDR_PANE_ID is unset, so no pane could be registered."
+    fi
+    die "\`${HERDR} pane current\` succeeded but its response carried no \`.result.pane.pane_id\`, and HERDR_PANE_ID is unset. No pane was registered."
+  fi
+
+  if ! valid_pane_id "$pane"; then
+    die "\`register\` resolved the target pane to $(printf '%q' "$pane"), which is not a pane id. Nothing was registered."
+  fi
+
+  # ALREADY REGISTERED IS NOT A FAILURE, AND IT IS NOT A SECOND REGISTRATION.
+  #
+  # The hook may have got here first - that is the normal case once the hook
+  # is installed. Renaming again would take the name the user already knows
+  # this pane by and hand it a different one, which is a surprise with no
+  # upside: the pane is already visible and already named. So this says what
+  # is true and leaves the name alone.
+  #
+  # The read is best-effort: a failed read is not proof of anything either
+  # way, and refusing to register on a failed read would make a transient
+  # herdr hiccup look like a refusal to do the work.
+  local existing_name=""
+  existing_name="$("$HERDR" agent get "$pane" 2>/dev/null | json_field '.result.agent.name' || true)"
+  if [ -n "$existing_name" ]; then
+    log "minimax-code: pane ${pane} is already registered as '${existing_name}', so it was left alone - the name was not changed and no second registration was made."
+    # The watcher is still worth starting: the pane may be registered with no
+    # watcher behind it, which is what leaves its state frozen.
+    watcher_autostart "$pane" "$MCODE_BIN_NAME"
+    log "minimax-code: pane ${pane} is registered as '${existing_name}' and its state is tracked."
+    return 0
+  fi
+
+  # 1. The registration. This is what establishes the claim on the pane, and
+  #    what makes the session report below acceptable.
+  if ! "$HERDR" pane report-agent "$pane" --source herdr:minimax-code --agent "$MCODE_BIN_NAME" --state unknown; then
+    die "\`${HERDR} pane report-agent ${pane}\` was refused, so the pane was not registered. Nothing else was attempted: without the claim on the pane the session report would be refused too, and the watcher would have nothing to watch."
+  fi
+
+  # 2. The name. It is the pane's unique handle, and it is what
+  #    `herdr agent get <name>` resolves. The label is not a name and must
+  #    not be used as one: every mcode pane shares the label.
+  local agent_name=""
+  agent_name=$(next_agent_name)
+  if [ -z "$agent_name" ]; then
+    log "minimax-code: pane ${pane} is registered but could not be named, because no free name could be found. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${pane} instead. The registration itself succeeded."
+  elif ! "$HERDR" agent rename "$pane" "$agent_name"; then
+    log "minimax-code: pane ${pane} is registered but could not be renamed, so it has no name. \`herdr agent get\`, \`read\` and \`wait\` will need the pane id ${pane} instead. The registration itself succeeded."
+  fi
+
+  # 3. The session identity and the resume command. Only accepted from the
+  #    reporter that already holds the pane, which step 1 established.
+  session_report "$pane" "$MCODE_BIN_NAME"
+
+  # 4. The watcher. The registration in step 1 fires the event that starts
+  #    one, and this makes sure it is running even if that event has not
+  #    arrived - the two are idempotent, and a pane with two watchers is
+  #    what the spawn lock exists to prevent.
+  watcher_autostart "$pane" "$MCODE_BIN_NAME"
+
+  if [ -n "$agent_name" ]; then
+    log "minimax-code: pane ${pane} is registered as '${agent_name}' and its state is tracked. \`herdr agent get ${agent_name}\` will resolve it."
+  else
+    log "minimax-code: pane ${pane} is registered and its state is tracked. Address it by the pane id ${pane}."
+  fi
+  return 0
+}
+
 main() {
   case "${1:-}" in
     start)
       cmd_start
+      ;;
+    register)
+      cmd_register
       ;;
     ensure-watcher)
       cmd_ensure_watcher
@@ -1315,7 +1418,7 @@ main() {
       cmd_uninstall_hook
       ;;
     *)
-      log "usage: mcode-plugin.sh start | ensure-watcher | install-hook | uninstall-hook"
+      log "usage: mcode-plugin.sh start | register | ensure-watcher | install-hook | uninstall-hook"
       exit 2
       ;;
   esac
