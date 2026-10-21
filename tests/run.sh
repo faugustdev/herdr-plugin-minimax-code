@@ -491,7 +491,7 @@ expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd
     lines="$(printf '%s\nagent\trename\t%s\t%s' "$lines" "$newpane" "$(expected_agent_name)")"
   fi
   if [ "$registered" = "reported" ] || [ "$registered" = "full" ]; then
-    lines="$(printf '%s\n%s' "$lines" "$(expected_session_tail "$newpane" "$registered")")"
+    lines="$(printf '%s\n%s' "$lines" "$(expected_session_tail "$newpane")")"
   fi
   printf '%s' "$lines"
 }
@@ -522,15 +522,31 @@ expected_sequence() { # expected_sequence <source-pane> <mcode-abs|""> [with-cwd
 # test diff rather than a silent behaviour change — it is the same
 # hardcoded-label shape as the watcher defect mcode-3 raised as P1, one file
 # over, and worth re-examining if the launcher's naming ever changes.
-expected_session_tail() { # expected_session_tail <new-pane> <registered>
+# watcher_label_of FILE - the label the staged watcher was handed, read from the
+# LAST field of its last recorded line.
+#
+# The `label` stub records `<args>\t<label>`, so the label is the final field and
+# the pane id is the first. Reading the last field rather than grepping for the
+# string matters: `mcode` is a PREFIX of `mcode-3` and of the pane id itself, so
+# a substring search cannot tell the label from the name it must not be - which is
+# exactly the distinction these cases exist to make.
+watcher_label_of() { # watcher_label_of <file>
+  [ -f "$1" ] || return 0
+  awk -F'\t' 'NF {last=$NF} END {if (last != "") print last}' "$1"
+}
+
+expected_session_tail() { # expected_session_tail <new-pane>
   local newpane="$1"
-  local registered="$2"
-  local label
-  if [ "$registered" = "full" ]; then
-    label="$(expected_agent_name)"
-  else
-    label="mcode"
-  fi
+  # THE LABEL, always - the agent's kind, which every mcode pane shares.
+  #
+  # It used to be the NAME the launch had just chosen (`mcode-3` when earlier
+  # names were taken), on the theory that a report carries the pane's handle.
+  # It does not: `--agent` is the label, and reporting a pane under a label
+  # other than the one it was registered with replaces its occupant, which
+  # costs it the name. Measured on herdr 0.9.5 (2026-10-21) - see the comment
+  # above `cmd_ensure_watcher` in bin/mcode-plugin.sh for the four-step
+  # reproduction.
+  local label="mcode"
   # `mcode --continue` is the sibling's documented MCODE_RESUME_CMD default, a
   # constant rather than anything derived from the resolved launcher path — so
   # it does not follow MCODE_PLUGIN_BIN when a case points the suite at a
@@ -1575,38 +1591,43 @@ case_28() { # #75: a watcher that fails to start is a warning, not a failure
   fi
 }
 
-# 29. THE WATCHER MUST INHERIT THE LABEL cmd_start CHOSE, NOT A LITERAL.
+# 29. THE WATCHER MUST REPORT UNDER THE LABEL, NEVER UNDER THE LAUNCH'S NAME.
 #
-#     mcode-watch.sh:24 is a bare `AGENT_LABEL="mcode"`, while the other two
-#     reporters are not: mcode-plugin.sh derives `mcode`, `mcode-2`, `mcode-3`
-#     from the name sequence, and mcode-session.sh reads
-#     ${MCODE_AGENT_LABEL:-minimax-code}. So the watcher reports under `mcode`
-#     regardless of what the launch renamed the pane to. The first pane agrees by
-#     luck; every pane after it does not.
+#     `--agent` carries the agent's KIND, not the pane's handle: every mcode
+#     pane shares the label `mcode`, exactly as every claude pane shares
+#     `claude`. The unique handle is the NAME herdr holds separately, installed
+#     by `herdr agent rename`, and it is what `herdr agent get <name>` resolves.
 #
-#     Today that is latent, because per #75's own evidence the watcher is rarely
-#     running and is opt-in. #75 build 1 makes it start on EVERY launch, which
-#     turns a rare edge case into a guaranteed one - and #74 measured that a
-#     wrong label/`--source` pair does not error, it silently fails to attach.
-#     The symptom would be a pane whose state updates quietly stop landing, which
-#     is precisely the stale-state bug #75 exists to fix. Worst shape: it appears
-#     to work on pane one and silently fails from pane two onward.
+#     Reporting a pane under a label OTHER than the one it was registered with
+#     replaces its occupant, and herdr clears the name with it. Measured on
+#     herdr 0.9.5 (2026-10-21), on a pane renamed to `mcode-2`:
+#
+#       report --agent mcode-2   -> {"name":null,"agent":"mcode-2"}
+#       report --agent mcode     -> the name survives
+#
+#     So a watcher handed the NAME deletes the name, once per state transition.
+#     The symptom is invisible on pane one - whose name and label are both
+#     `mcode` - and permanent from pane two onwards, which is every pane whose
+#     name is `mcode-2` or later. This case used to assert the opposite, and
+#     the defect it was written to prevent was real; the belief behind it was
+#     not. A report carries a label. It does not carry a name.
 #
 #     WHY ONE LAUNCH AND NOT TWO: tests/fake-herdr's `agent list` is a fixed
 #     response per invocation and does not evolve between launches, so a genuine
 #     two-pane case needs a stateful stub - a change to tests/fake-herdr, which is
 #     not my file this round. The `agent-names-taken` fault makes the assigned
-#     name `mcode-3`, so ANY hardcoded literal fails this case and a correct
-#     implementation passes. Same defect, no stub change, and the comment says so
+#     name `mcode-3`, so ANY implementation that hands the watcher the name
+#     fails this case and a correct one passes. Same defect, no stub change, and the comment says so
 #     so nobody "simplifies" it back to two launches later.
-case_29() { # #75: the watcher inherits the label the launch chose, not a literal
+case_29() { # #75: the watcher reports under the LABEL, never under the launch's NAME
   setup_case
   export HERDR_PANE_ID="$SRC_PANE"
   local copy root
   copy="$(stage_plugin label)"
   root="$CASE_DIR/plugin"
   export MCODE_WATCH_AUTOSTART=1
-  # The name the launcher will pick is mcode-3, not mcode.
+  # The name the launcher will pick is mcode-3, not mcode. That is what makes
+  # this case able to tell the label and the name apart.
   export FAKE_HERDR_FAULT="agent-names-taken"
 
   run_entrypoint_at "$copy"
@@ -1617,18 +1638,34 @@ case_29() { # #75: the watcher inherits the label the launch chose, not a litera
   fi
   local want_name
   want_name="$(expected_agent_name)"
-  # What the watcher must be told, and what a hardcoded literal would produce.
-  if ! grep -qF "$want_name" "$root/watcher-ran"; then
-    note "the watcher was started without the label the launch chose" \
-         "('${want_name}'); a hardcoded literal reports state under the wrong" \
-         "agent name and herdr silently fails to attach it"
+
+  # THE LABEL, NOT THE NAME.
+  #
+  # `--agent` carries the agent's KIND - every mcode pane shares `mcode`,
+  # exactly as every claude pane shares `claude`. The name is a separate thing
+  # herdr holds, installed by `herdr agent rename`, and it is what makes one
+  # pane addressable among several. This case used to assert the opposite, on
+  # the theory that a report carries the pane's handle: it does not, and
+  # reporting a pane under a label other than the one it was registered with
+  # replaces its occupant and clears the name with it.
+  #
+  # Measured on herdr 0.9.5 (2026-10-21), on a pane renamed to `mcode-2`:
+  #   report --agent mcode-2  -> {"name":null,"agent":"mcode-2"}
+  #   report --agent mcode    -> the name survives
+  # So a watcher handed the NAME deletes the name, once per state transition,
+  # and the symptom is invisible on pane one - whose name and label are both
+  # `mcode` - and permanent from pane two onwards.
+  if [ "$(watcher_label_of "$root/watcher-ran")" != "mcode" ]; then
+    note "the watcher was not given the agent label 'mcode'; it must report under" \
+         "the label, and the launcher's name is not a label"
     sed 's/^/          /' "$root/watcher-ran"
   fi
-  # Stated explicitly, because this is the finding: a watcher hardcoded to
-  # `mcode` looks correct on the very first pane.
-  if grep -q "mcode"$'\t' "$root/watcher-ran"; then
-    note "the watcher was given the bare label 'mcode' while the pane was" \
-         "registered as '${want_name}'"
+  # And it must NOT be given the name the launch chose.
+  if [ "$(watcher_label_of "$root/watcher-ran")" = "$want_name" ]; then
+    note "the watcher was given the launcher's NAME ('${want_name}'); reporting under" \
+         "a label the pane was not registered with replaces its occupant and clears" \
+         "the name the rename just installed"
+    sed 's/^/          /' "$root/watcher-ran"
   fi
 }
 
@@ -2201,7 +2238,7 @@ case_39() { # #84: a watcher started OUTSIDE ensure_watcher is respected
   done
 }
 
-case_40() { # #84: the event path reports under the pane's NAME when it has one
+case_40() { # #84: the event path reports under the LABEL, never under the pane's NAME
   setup_case
   local copy root
   copy="$(stage_plugin label)"
@@ -2219,41 +2256,55 @@ case_40() { # #84: the event path reports under the pane's NAME when it has one
     return
   fi
 
-  # The name, not the event's label. The event payload carries `agent`, which for
-  # a launched pane is the literal `mcode`; the pane's NAME is `mcode-7`. A
-  # watcher handed `mcode` for a pane called `mcode-7` reports every state under
-  # a name that pane does not have — the second-pane divergence CLAUDE.md
-  # records, reintroduced through the event path.
-  if ! grep -qF "mcode-7" "$root/watcher-ran"; then
-    note "the watcher was not given the pane's name 'mcode-7'; it was given the" \
-         "event's agent label instead, so every state it reports is attributed to" \
-         "an agent name this pane does not have"
+  # THE EVENT'S LABEL, NOT THE PANE'S NAME.
+  #
+  # This case used to assert the opposite, on the theory that the event's label
+  # is "the bare label `mcode`" and the pane's name is what a report should
+  # carry. It is the other way round. `--agent` is the agent's kind; the name
+  # is a separate handle herdr holds. Reporting a pane under a label other than
+  # the one it was registered with replaces its occupant and clears the name
+  # with it - measured on herdr 0.9.5 (2026-10-21), where a pane renamed to
+  # `mcode-2` and then reported under `--agent mcode-2` answered
+  # `agent_not_found` for `herdr agent get mcode-2`.
+  #
+  # So the event path reading the pane's NAME and handing it to the watcher is
+  # not a hardening measure; it is the defect. It deleted the name the plugin
+  # had installed, on every state transition, and - because the event path
+  # re-spawns the watcher from the payload - it reproduced itself every time
+  # the state moved.
+  if [ "$(watcher_label_of "$root/watcher-ran")" != "minimax-code" ]; then
+    note "the watcher was not given the event's agent label 'minimax-code'; it must" \
+         "report under the label, and the pane's name is not a label"
     sed 's/^/          /' "$root/watcher-ran"
     return
   fi
-  if grep -q "mcode"$'\t' "$root/watcher-ran"; then
-    note "the watcher was handed the bare label 'mcode' for a pane named mcode-7"
+  # And it must NOT be given the pane's name.
+  if [ "$(watcher_label_of "$root/watcher-ran")" = "mcode-7" ]; then
+    note "the watcher was handed the pane's NAME ('mcode-7'); reporting under a label" \
+         "the pane was not registered with replaces its occupant and clears the name"
+    sed 's/^/          /' "$root/watcher-ran"
   fi
 
-  # And the read is not decorative: with herdr reporting no name, the fallback
-  # is the label, and that is correct rather than a failure. Asserted so the
-  # difference between the two shapes is pinned from both sides.
+  # And the pane's NAME makes no difference either way: a pane herdr reports
+  # no name for is watched exactly as well as one it does, because the watcher
+  # never needed the name. Asserted so the difference between the two shapes is
+  # pinned from both sides.
   #
   # A DIFFERENT pane id, and that is load-bearing rather than tidiness:
   # setup_case reuses $WORK/$CURRENT_CASE, so the staged stub and its marker file
   # are the same ones the first half already wrote. Re-checking `mcode-7` here
-  # would read the first half's own line and pass for the wrong reason — which
+  # would read the first half's own line and pass for the wrong reason - which
   # is exactly what happened the first time this was written.
   unset FAKE_HERDR_AGENT_NAME
   run_event_handler_at "$copy" "$SECOND_PANE" "minimax-code"
   if ! wait_for_file_content "$root/watcher-ran" "$SECOND_PANE" "$WATCHER_SPAWN_WAIT_MS"; then
     note "an unnamed pane got no watcher; the label is enough to watch a pane," \
-         "so the fallback must still start one"
+         "so the watcher must start one all the same"
     return
   fi
   if ! grep -F "$SECOND_PANE" "$root/watcher-ran" | grep -qF "minimax-code"; then
-    note "for a pane herdr reports no name for, the watcher should fall back to" \
-         "the event's own agent label"
+    note "for a pane herdr reports no name for, the watcher should report under" \
+         "the event's own agent label all the same"
     sed 's/^/          /' "$root/watcher-ran"
   fi
 }
